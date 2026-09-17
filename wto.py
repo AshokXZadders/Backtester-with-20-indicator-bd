@@ -1,56 +1,6 @@
-#!/usr/bin/env python3
-"""
-name: datacan5_fixed2
-Terminal-based Multi-Indicator Backtester
-
-FIXES APPLIED (over datacan5_fixed):
-  FIX-4: Pending SL/TP stored as DISTANCES not absolute levels.
-          datacan5_fixed stored _pending_sl = close_price - sl_dist (absolute),
-          then at execution added (assumed_fill - open_price) to it — this
-          only adjusts for slippage but IGNORES gap between signal-bar close
-          and next-bar open.  Example:
-            signal bar close = 100, sl_dist = 2  →  _pending_sl = 98
-            next bar open    = 103 (gap up)
-            old code: sl = 98 + slip ≈ 98  (stop is now 5 pts below fill — wrong)
-            new code: sl = 103 + slip - 2  = 101  (always 2 pts below actual fill)
-          The fix: store _pending_sl_dist and _pending_tp_dist, then compute
-          absolute SL/TP from assumed_fill at execution time.
-
-  FIX-5: Class-level pending flags (_pending_buy, _pending_sell) promoted to
-          instance state in init() only — removed class-level defaults that
-          could leak state across optimiser runs when the class is reused.
-
-Fixes retained from datacan5_fixed (FIX-1, FIX-2, FIX-3):
-  FIX-1: Entry fills at next-bar open (no entry lookahead)
-  FIX-2: Compounded Sharpe uses sqrt(252) annualisation
-  FIX-3: Monte Carlo uses bootstrap resampling with replacement
-
-Fixes retained from datacan5 (original):
-  1. Workers no longer hang
-  2. Solo screen lenient mode
-  3. Stage 2 _GLOBAL_ALL_INDICATORS bug fixed
-  4. Monte Carlo column name handling
-  5. Progress display
-  6. score_stats lenient flag
-"""
-
-import sys
-import os
-import json
-import warnings
-import argparse
-import time
-import traceback
-import itertools
-import random
-from collections import deque
-from multiprocessing import Pool, cpu_count
-
-import pandas as pd
-import numpy as np
-from backtesting import Backtest, Strategy
-from scipy.signal import argrelextrema
-import talib
+'''
+sys, os, json, warnings, argparse, time, traceback, itertools, random, collections, and multiprocessing are all standard library
+'''
 
 warnings.filterwarnings('ignore')
 os.environ['PYTHONWARNINGS'] = 'ignore'
@@ -673,41 +623,6 @@ def _run_combo_worker(combo):
         return (-1000.0, combo, None)
 
 
-def _run_combo_worker_coarse(combo):
-    """
-    PHASE 1 (coarse screen): a single bt.run() per combo using the FIRST
-    grid value for every indicator param and the FIRST RR_GRID value —
-    no bt.optimize(), no cartesian grid. This is a fast, rough ranking
-    pass used only to prune the combo list before Phase 2's full-
-    resolution bt.optimize() runs on the survivors. Final scores/results
-    are NEVER taken from this pass — it only decides who advances.
-    Risk: a combo could rank poorly here at its default params but be
-    genuinely good elsewhere in its grid. Mitigated with lenient scoring
-    (same approach as Stage 1's solo screen) and a generous survivor
-    count — see --phase1-survivors.
-    """
-    try:
-        from backtesting import Backtest
-        MultiIndicatorStrategy._swing_cache = _GLOBAL_FIB_CACHE
-        bt = Backtest(
-            _GLOBAL_DF, MultiIndicatorStrategy,
-            cash=_GLOBAL_CASH, commission=_GLOBAL_COMMISSION,
-            exclusive_orders=True
-        )
-        run_kwargs = {ind: False for ind in _GLOBAL_ALL_INDICATORS}
-        for ind in combo:
-            run_kwargs[ind] = True
-            for p, vals in _GLOBAL_INDICATOR_GRID[ind].items():
-                run_kwargs[p] = vals[0]
-        for k, vals in _GLOBAL_RR_GRID.items():
-            run_kwargs[k] = vals[0] if isinstance(vals, list) else vals
-        stats = bt.run(**run_kwargs)
-        sc = score_stats(stats, lenient=True)
-        return (sc, combo)
-    except Exception:
-        return (-1000.0, combo)
-
-
 def _build_fib_cache(df):
     from itertools import product as iproduct
     high  = np.ascontiguousarray(df['High'].values,  dtype=np.float64)
@@ -1268,6 +1183,43 @@ def merge_garch(df, garch_file):
     return merged
 
 
+def load_alpha_file(alpha_file):
+    """
+    Reads alpha_pipeline.py's output CSV (Date index, Regime / MasterPred /
+    PredVol columns). MasterPred is a price-level forecast (Y-hat_{t+1}),
+    PredVol is a fractional daily-return volatility forecast — same units
+    and convention as GarchVol, NOT a price distance.
+    """
+    df = pd.read_csv(alpha_file, index_col=0, parse_dates=True)
+    df.columns = [c.strip() for c in df.columns]
+    needed = {}
+    for want in ('Regime', 'MasterPred', 'PredVol'):
+        col = next((c for c in df.columns if c.lower() == want.lower()), None)
+        if col is None:
+            raise ValueError(f"'{want}' column not found in {alpha_file}. "
+                              f"Found: {list(df.columns)}")
+        needed[want] = col
+    return df[[needed['Regime'], needed['MasterPred'], needed['PredVol']]].rename(
+        columns={needed['Regime']: 'Regime',
+                 needed['MasterPred']: 'MasterPred',
+                 needed['PredVol']: 'PredVol'})
+
+
+def merge_alpha(df, alpha_file):
+    """
+    Left-joins Regime/MasterPred/PredVol onto the OHLCV df by date,
+    forward-filling minor date-alignment gaps — same pattern as
+    merge_garch(). Bars before alpha_pipeline.py's burn-in period stay
+    NaN intentionally; the strategy skips alpha-gated/alpha-sized entries
+    on those bars rather than pretending a forecast exists.
+    """
+    alpha = load_alpha_file(alpha_file)
+    merged = df.join(alpha, how='left')
+    for col in ('Regime', 'MasterPred', 'PredVol'):
+        merged[col] = merged[col].ffill()
+    return merged
+
+
 # ============================================================================
 # STRATEGY
 #
@@ -1334,8 +1286,29 @@ class MultiIndicatorStrategy(Strategy):
     #   'legacy' = original behavior (ATR stop, full-equity size)
     #   'atr'    = ATR stop + risk_pct-based size (NEW real baseline)
     #   'garch'  = GarchVol stop + risk_pct-based size (Option 4)
+    #   'alpha'  = PredVol (from alpha_pipeline.py) stop + risk_pct-based
+    #              size — reuses garch_sl_mult as the multiplier since both
+    #              are fractional-vol-forecast-driven stops on the same
+    #              conceptual footing (kept comparable via --dual-compare)
     sizing_mode   = 'legacy'
     garch_sl_mult = 1.5
+
+    # ALPHA PIPELINE: direction_mode controls whether the HMM->SARIMAX->
+    # LSTM->GARCH pipeline's predicted direction (MasterPred vs close)
+    # influences trade entries, independent of sizing_mode:
+    #   'off'     = predicted direction ignored entirely (sizing-only, if
+    #               sizing_mode='alpha' is also set)
+    #   'gate'    = an indicator-signaled buy is only taken if MasterPred
+    #               also predicts a higher close next bar; if MasterPred
+    #               is NaN (burn-in) the trade is blocked, not allowed
+    #               through ungated
+    #   'replace' = indicator votes are ignored for ENTRIES; a buy is
+    #               taken purely because MasterPred predicts a higher
+    #               close. Exits still use indicator sell-votes + the
+    #               existing TP/SL/max_hold_bars machinery — direction_mode
+    #               only ever governs entries, never exits, to avoid
+    #               overriding risk controls that are already working
+    direction_mode = 'off'
 
     def init(self):
         close  = np.array(self.data.Close)
@@ -1493,6 +1466,19 @@ class MultiIndicatorStrategy(Strategy):
             self._garch_vol = np.array(self.data.GarchVol)
         else:
             self._garch_vol = None
+
+        # Alpha pipeline (HMM->SARIMAX->LSTM->GARCH) support: same pattern
+        # as GarchVol above — columns merged onto df before Backtest() is
+        # built (see merge_alpha()), so backtesting.py exposes them
+        # automatically as self.data.<Col> if present.
+        if hasattr(self.data, 'MasterPred'):
+            self._master_pred = np.array(self.data.MasterPred)
+        else:
+            self._master_pred = None
+        if hasattr(self.data, 'PredVol'):
+            self._pred_vol = np.array(self.data.PredVol)
+        else:
+            self._pred_vol = None
 
     def _risk_based_size(self, sl_dist, close_price):
         """
@@ -1720,6 +1706,23 @@ class MultiIndicatorStrategy(Strategy):
             do_buy  = (buy_votes > sell_votes and buy_votes > 0)
             do_sell = (sell_votes > buy_votes and sell_votes > 0)
 
+        # ── ALPHA PIPELINE: direction_mode gates/replaces ENTRIES only ────
+        # (exits are untouched — see class docstring above for rationale)
+        if self.direction_mode in ('gate', 'replace'):
+            pred_up = None
+            if self._master_pred is not None:
+                mp = _v(self._master_pred)
+                if mp is not None:
+                    pred_up = mp > close_price
+
+            if self.direction_mode == 'replace':
+                # indicator votes irrelevant for entries — purely Y-hat driven
+                do_buy = bool(pred_up)              # False if pred_up is None (NaN/burn-in)
+            elif self.direction_mode == 'gate':
+                # indicator vote must ALSO agree with Y-hat; no confirmation
+                # available (NaN/burn-in) -> blocked, not allowed through
+                do_buy = do_buy and (pred_up is True)
+
         # ── Execute: fill at next bar open via backtesting.py native model ─
         # Signal fires on bar N close. backtesting.py executes market orders
         # at bar N+1 open natively — no pending flag needed.
@@ -1750,6 +1753,15 @@ class MultiIndicatorStrategy(Strategy):
                 # GarchVol is a fractional daily-return forecast (e.g. 0.018),
                 # NOT a price distance like ATR — convert explicitly.
                 sl_dist = float(self.garch_sl_mult) * gv * close_price
+            elif self.sizing_mode == 'alpha':
+                if self._pred_vol is None:
+                    return  # no alpha-pipeline data merged for this run — skip entry
+                pv = _v(self._pred_vol)
+                if pv is None:
+                    return  # still in PredVol's burn-in period — skip entry
+                # PredVol is a fractional-vol forecast, same convention as
+                # GarchVol — reuses garch_sl_mult for direct comparability
+                sl_dist = float(self.garch_sl_mult) * pv * close_price
             else:
                 sl_dist = float(self.atr_sl_mult) * atr
 
@@ -1900,14 +1912,18 @@ def display_results(combo, stats, total_time, top_results, indicator_grid,
     print(f"\n{'='*70}\n")
 
 
-def print_dual_sizing_comparison(atr_stats, garch_stats, cash=100_000, reinvest_rate=0.50):
+def print_dual_sizing_comparison(atr_stats, other_stats, cash=100_000,
+                                 reinvest_rate=0.50, label_a='ATR-risk',
+                                 label_b='GARCH-risk'):
     """
-    Prints the ATR-risk-sizing vs GARCH-risk-sizing results SIDE BY SIDE,
-    for the exact same combo/indicator params/signal logic — only the
-    sizing_mode differs between the two runs that produced these stats.
+    Prints two sizing_mode runs SIDE BY SIDE for the exact same combo/
+    indicator params/signal logic — only sizing_mode differs between the
+    runs that produced these stats. label_a/label_b let callers reuse this
+    for ATR-vs-GARCH (Option 4) or ATR-vs-alpha (alpha pipeline) without
+    the printed labels lying about which comparison actually ran.
     """
     print(f"\n{'='*70}")
-    print(f"  DUAL SIZING COMPARISON — same signals, ATR-risk vs GARCH-risk")
+    print(f"  DUAL SIZING COMPARISON — same signals, {label_a} vs {label_b}")
     print(f"{'='*70}")
 
     def g(stats, key, default=0.0):
@@ -1917,7 +1933,7 @@ def print_dual_sizing_comparison(atr_stats, garch_stats, cash=100_000, reinvest_
             return default
 
     atr_comp   = compute_compounded_stats(atr_stats,   cash=cash, reinvest_rate=reinvest_rate)
-    garch_comp = compute_compounded_stats(garch_stats, cash=cash, reinvest_rate=reinvest_rate)
+    garch_comp = compute_compounded_stats(other_stats, cash=cash, reinvest_rate=reinvest_rate)
 
     rows = [
         ('Return [%]',        lambda s: g(s, 'Return [%]'),          '{:>10.2f}%'),
@@ -1930,18 +1946,14 @@ def print_dual_sizing_comparison(atr_stats, garch_stats, cash=100_000, reinvest_
         ('Equity Final [$]',  lambda s: g(s, 'Equity Final [$]'),    '{:>11,.0f}'),
     ]
 
-    print(f"\n  {'Metric':<22} {'ATR-risk':>12} {'GARCH-risk':>12}   Winner")
+    print(f"\n  {'Metric':<22} {label_a:>12} {label_b:>12}   Winner")
     print(f"  {'─'*62}")
     for label, fn, fmt in rows:
         a_val = fn(atr_stats)
-        g_val = fn(garch_stats)
+        g_val = fn(other_stats)
         a_txt = fmt.format(a_val)
         g_txt = fmt.format(g_val)
-        higher_is_better = label not in ('Max Drawdown [%]',)
-        if label == 'Max Drawdown [%]':
-            winner = 'GARCH' if g_val > a_val else ('ATR' if a_val > g_val else '=')
-        else:
-            winner = 'GARCH' if g_val > a_val else ('ATR' if a_val > g_val else '=')
+        winner = label_b if g_val > a_val else (label_a if a_val > g_val else '=')
         print(f"  {label:<22} {a_txt:>12} {g_txt:>12}   {winner}")
 
     print(f"  {'─'*62}")
@@ -1976,27 +1988,48 @@ def main():
     parser.add_argument('--pipeline',     action='store_true')
     parser.add_argument('--top-n',        type=int, default=14)
     parser.add_argument('--bayes-calls',  type=int, default=150)
+    parser.add_argument('--stop-after-combo', action='store_true',
+                        help='Run Stage 1 (solo screen) + Stage 2 (combo search) only, '
+                             'then print top-5 combos and exit — skips Bayesian '
+                             'fine-tuning (Stage 3) and Monte Carlo (Stage 4). Useful '
+                             'for a fast sanity-check pass before committing to a full '
+                             'pipeline run.')
     parser.add_argument('--fib-debug',    action='store_true')
     parser.add_argument('--start-date',   type=str, default=None)
     parser.add_argument('--end-date',     type=str, default=None)
 
     # Option 4 — GARCH Pipeline
-    parser.add_argument('--sizing-mode',  type=str, choices=['legacy', 'atr', 'garch'],
+    parser.add_argument('--sizing-mode',  type=str, choices=['legacy', 'atr', 'garch', 'alpha'],
                         default='legacy',
                         help="'legacy' = original full-equity sizing (unchanged behavior); "
                              "'atr' = NEW real risk_pct-based sizing off ATR; "
                              "'garch' = Option 4: risk_pct-based sizing off a GJR-GARCH "
-                             "volatility forecast (requires --garch-file)")
+                             "volatility forecast (requires --garch-file); "
+                             "'alpha' = risk_pct-based sizing off the HMM->SARIMAX->LSTM->"
+                             "GARCH alpha pipeline's PredVol (requires --alpha-file)")
     parser.add_argument('--garch-file',   type=str, default=None,
                         help='garch_risk.py output CSV (Date, GarchVol) — required when '
                              '--sizing-mode garch')
     parser.add_argument('--garch-sl-mult', type=float, default=1.5,
-                        help='Stop-loss multiple applied to GarchVol (mirrors atr_sl_mult, '
-                             'default 1.5)')
+                        help='Stop-loss multiple applied to GarchVol/PredVol (mirrors '
+                             'atr_sl_mult, default 1.5)')
     parser.add_argument('--dual-compare', action='store_true',
-                        help="After a --sizing-mode garch --pipeline run, also re-run the "
-                             "SAME best combo/params under sizing_mode='atr' and print a "
+                        help="After a --sizing-mode garch|alpha --pipeline run, also re-run "
+                             "the SAME best combo/params under sizing_mode='atr' and print a "
                              "side-by-side comparison table")
+
+    # Alpha pipeline (HMM -> SARIMAX -> LSTM -> GARCH)
+    parser.add_argument('--alpha-file',   type=str, default=None,
+                        help='alpha_pipeline.py output CSV (Date, Regime, MasterPred, '
+                             'PredVol) — required when --sizing-mode alpha or '
+                             '--direction-mode is not "off"')
+    parser.add_argument('--direction-mode', type=str, choices=['off', 'gate', 'replace'],
+                        default='off',
+                        help="'off' = MasterPred direction ignored (sizing-only, if "
+                             "sizing_mode=alpha); 'gate' = an indicator-signaled buy is only "
+                             "taken if MasterPred also predicts a higher close; "
+                             "'replace' = entries decided purely by MasterPred direction, "
+                             "indicator votes ignored for entries (exits unaffected)")
 
     args = parser.parse_args()
 
@@ -2016,6 +2049,16 @@ def main():
             print(f"ERROR: GARCH file not found: {args.garch_file}")
             sys.exit(1)
 
+    needs_alpha_file = (args.sizing_mode == 'alpha') or (args.direction_mode != 'off')
+    if needs_alpha_file:
+        if not args.alpha_file:
+            print("ERROR: --sizing-mode alpha or --direction-mode gate/replace "
+                  "requires --alpha-file")
+            sys.exit(2)
+        if not os.path.exists(args.alpha_file):
+            print(f"ERROR: Alpha file not found: {args.alpha_file}")
+            sys.exit(1)
+
     print(f"\n{'='*70}")
     print(f"  MULTI-INDICATOR BACKTESTER  datacan5_fixed2")
     print(f"  FIX-1: next-bar open fills")
@@ -2033,6 +2076,17 @@ def main():
     elif args.sizing_mode == 'atr':
         print(f"  {'─'*66}")
         print(f"  Sizing mode: ATR-risk (real risk_pct-based sizing, newly enabled)")
+    if args.sizing_mode == 'alpha' or args.direction_mode != 'off':
+        print(f"  {'─'*66}")
+        print(f"  ★ ALPHA PIPELINE  (HMM -> SARIMAX -> LSTM -> GARCH)")
+        print(f"     Alpha file     : {args.alpha_file}")
+        print(f"     sizing_mode    : {args.sizing_mode}"
+              + ("  ← PredVol drives stop + size" if args.sizing_mode == 'alpha' else ""))
+        print(f"     direction_mode : {args.direction_mode}"
+              + {"off": "  ← MasterPred ignored for entries",
+                 "gate": "  ← indicator buy also requires MasterPred agreement",
+                 "replace": "  ← entries decided purely by MasterPred direction"
+                 }[args.direction_mode])
     print(f"{'='*70}")
 
     existing_cp = _load_checkpoint()
@@ -2053,6 +2107,13 @@ def main():
             print(f"\n  GarchVol merged — {n_garch_valid}/{len(df)} bars have a valid forecast "
                   f"(earlier bars are pre-burn-in and will skip GARCH-sized entries)")
 
+        if needs_alpha_file:
+            df = merge_alpha(df, args.alpha_file)
+            n_alpha_valid = df['MasterPred'].notna().sum()
+            print(f"\n  Alpha pipeline merged — {n_alpha_valid}/{len(df)} bars have a valid "
+                  f"MasterPred/PredVol (earlier bars are pre-burn-in and will skip "
+                  f"alpha-gated/alpha-sized entries)")
+
         df, warmup, df_test = choose_data_range(df)
         print(f"\n  Candles : {len(df)}")
         print(f"  Range   : {df.index[0].date()} → {df.index[-1].date()}")
@@ -2061,9 +2122,10 @@ def main():
         print(f"  Warmup  : {warmup} bars")
 
         commission_frac = args.commission / 100.0
-        MultiIndicatorStrategy.signal_mode  = int(args.signal_mode)
-        MultiIndicatorStrategy.sizing_mode  = args.sizing_mode
+        MultiIndicatorStrategy.signal_mode   = int(args.signal_mode)
+        MultiIndicatorStrategy.sizing_mode   = args.sizing_mode
         MultiIndicatorStrategy.garch_sl_mult = float(args.garch_sl_mult)
+        MultiIndicatorStrategy.direction_mode = args.direction_mode
         all_indicators  = list(get_indicator_grid().keys())
 
         if args.fib_debug:
@@ -2118,6 +2180,15 @@ def main():
                 print("\n  ERROR: No valid combos in Stage 2.")
                 sys.exit(1)
 
+            if args.stop_after_combo:
+                display_results(best_combo, best_stats, total_time, top_results,
+                                get_indicator_grid(), reinvest_rate=args.reinvest_rate,
+                                cash=args.cash)
+                print(f"\n  --stop-after-combo set — skipping Bayesian fine-tune "
+                      f"(Stage 3) and Monte Carlo (Stage 4).\n")
+                _delete_checkpoint()
+                return
+
             final_stats, best_params, final_kwargs = run_bayesian_finetune(
                 df, args.cash, commission_frac, best_combo, best_stats,
                 all_indicators, warmup_bars=warmup,
@@ -2129,11 +2200,13 @@ def main():
                             get_indicator_grid(), reinvest_rate=args.reinvest_rate,
                             cash=args.cash)
 
-            # ── Option 4 dual comparison: same combo/params, ATR-risk vs
-            #    GARCH-risk sizing, re-using the EXACT kwargs Stage 3 landed
-            #    on so entries/exits are identical and only sizing differs ──
-            if args.sizing_mode == 'garch' and args.dual_compare:
+            # ── Dual comparison: same combo/params, ATR-risk vs GARCH-risk
+            #    OR ATR-risk vs alpha-pipeline-risk sizing, re-using the
+            #    EXACT kwargs Stage 3 landed on so entries/exits are
+            #    identical and only sizing differs ──
+            if args.sizing_mode in ('garch', 'alpha') and args.dual_compare:
                 shadow_kwargs = dict(final_kwargs)
+                original_sizing_mode = args.sizing_mode
                 MultiIndicatorStrategy.sizing_mode = 'atr'
                 try:
                     bt_shadow = Backtest(df, MultiIndicatorStrategy,
@@ -2143,12 +2216,14 @@ def main():
                 finally:
                     # restore even if the shadow run raises — otherwise the
                     # walk-forward test below silently inherits sizing_mode
-                    # 'atr' instead of 'garch', since test_kwargs never sets
-                    # sizing_mode explicitly and relies on the class attr
-                    MultiIndicatorStrategy.sizing_mode = 'garch'
+                    # 'atr' instead of the real one, since test_kwargs never
+                    # sets sizing_mode explicitly and relies on the class attr
+                    MultiIndicatorStrategy.sizing_mode = original_sizing_mode
+                label_b = 'GARCH-risk' if original_sizing_mode == 'garch' else 'alpha-risk'
                 print_dual_sizing_comparison(atr_shadow_stats, final_stats,
                                              cash=args.cash,
-                                             reinvest_rate=args.reinvest_rate)
+                                             reinvest_rate=args.reinvest_rate,
+                                             label_a='ATR-risk', label_b=label_b)
 
             if df_test is not None and best_combo is not None:
                     print(f"\n{'='*70}")
